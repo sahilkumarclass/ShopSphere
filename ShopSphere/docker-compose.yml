@@ -1,0 +1,239 @@
+services:
+
+  # ─────────────────────────────  Infrastructure  ─────────────────────────────
+
+  mysql:
+    image: mysql:8.0
+    container_name: shopsphere-mysql
+    profiles: ["infra", "all"]
+    environment:
+      MYSQL_ROOT_PASSWORD: root
+    ports:
+      - "3306:3306"
+    volumes:
+      - mysql_data:/var/lib/mysql
+      - ./mysql/init.sql:/docker-entrypoint-initdb.d/init.sql:ro
+    healthcheck:
+      test: ["CMD", "mysqladmin", "ping", "-h", "localhost", "-uroot", "-proot"]
+      interval: 10s
+      timeout: 5s
+      retries: 10
+
+  zookeeper:
+    image: confluentinc/cp-zookeeper:7.4.0
+    container_name: shopsphere-zookeeper
+    profiles: ["infra", "all"]
+    environment:
+      ZOOKEEPER_CLIENT_PORT: 2181
+      ZOOKEEPER_TICK_TIME: 2000
+
+  kafka:
+    image: confluentinc/cp-kafka:7.4.0
+    container_name: shopsphere-kafka
+    profiles: ["infra", "all"]
+    depends_on:
+      - zookeeper
+    ports:
+      - "9092:9092"
+      - "29092:29092"
+    environment:
+      KAFKA_BROKER_ID: 1
+      KAFKA_ZOOKEEPER_CONNECT: zookeeper:2181
+      KAFKA_LISTENER_SECURITY_PROTOCOL_MAP: PLAINTEXT:PLAINTEXT,PLAINTEXT_HOST:PLAINTEXT
+      KAFKA_ADVERTISED_LISTENERS: PLAINTEXT://kafka:29092,PLAINTEXT_HOST://localhost:9092
+      KAFKA_OFFSETS_TOPIC_REPLICATION_FACTOR: 1
+      KAFKA_TRANSACTION_STATE_LOG_MIN_ISR: 1
+      KAFKA_TRANSACTION_STATE_LOG_REPLICATION_FACTOR: 1
+      KAFKA_AUTO_CREATE_TOPICS_ENABLE: "true"
+
+  zipkin:
+    image: openzipkin/zipkin:latest
+    container_name: shopsphere-zipkin
+    profiles: ["infra", "all"]
+    ports:
+      - "9411:9411"
+
+  prometheus:
+    image: prom/prometheus:latest
+    container_name: shopsphere-prometheus
+    profiles: ["infra", "all"]
+    ports:
+      - "9090:9090"
+    volumes:
+      - ./prometheus/prometheus.yml:/etc/prometheus/prometheus.yml:ro
+      - prometheus_data:/prometheus
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
+
+  grafana:
+    image: grafana/grafana:latest
+    container_name: shopsphere-grafana
+    profiles: ["infra", "all"]
+    ports:
+      - "3000:3000"
+    environment:
+      GF_SECURITY_ADMIN_USER: admin
+      GF_SECURITY_ADMIN_PASSWORD: admin
+      GF_USERS_ALLOW_SIGN_UP: "false"
+    volumes:
+      - grafana_data:/var/lib/grafana
+      - ./grafana/provisioning/datasources:/etc/grafana/provisioning/datasources:ro
+      - ./grafana/provisioning/dashboards:/etc/grafana/provisioning/dashboards:ro
+    depends_on:
+      - prometheus
+
+  sonarqube:
+    image: sonarqube:lts-community
+    container_name: shopsphere-sonarqube
+    profiles: ["infra", "all"]
+    ports:
+      - "9000:9000"
+    environment:
+      SONAR_ES_BOOTSTRAP_CHECKS_DISABLE: "true"
+    volumes:
+      - sonarqube_data:/opt/sonarqube/data
+      - sonarqube_logs:/opt/sonarqube/logs
+      - sonarqube_extensions:/opt/sonarqube/extensions
+
+  mailhog:
+    image: mailhog/mailhog:latest
+    container_name: shopsphere-mailhog
+    profiles: ["infra", "all"]
+    ports:
+      - "1025:1025"   # SMTP
+      - "8025:8025"   # Web UI
+
+  # ─────────────────────────────  Backend services  ─────────────────────────────
+  # Run with --profile all (or full) once each module's JAR has been built (`mvn -DskipTests package`).
+
+  eureka-server:
+    build: ./eureka-server
+    container_name: shopsphere-eureka
+    profiles: ["all"]
+    ports:
+      - "8761:8761"
+
+  config-server:
+    build: ./config-server
+    container_name: shopsphere-config
+    profiles: ["all"]
+    ports:
+      - "8888:8888"
+    depends_on:
+      - eureka-server
+    environment:
+      EUREKA_CLIENT_SERVICEURL_DEFAULTZONE: http://eureka-server:8761/eureka/
+      CONFIG_REPO_PATH: /config-repo
+    volumes:
+      - ./config-repo:/config-repo:ro
+
+  api-gateway:
+    build: ./api-gateway
+    container_name: shopsphere-gateway
+    profiles: ["all"]
+    ports:
+      - "8080:8080"
+    depends_on:
+      - eureka-server
+      - config-server
+    environment:
+      CONFIG_SERVER_URL: http://config-server:8888
+      EUREKA_CLIENT_SERVICEURL_DEFAULTZONE: http://eureka-server:8761/eureka/
+      ZIPKIN_ENDPOINT: http://zipkin:9411/api/v2/spans
+
+  auth-service:
+    build: ./auth-service
+    container_name: shopsphere-auth
+    profiles: ["all"]
+    ports:
+      - "8081:8081"
+    depends_on:
+      mysql: { condition: service_healthy }
+      eureka-server: { condition: service_started }
+      config-server: { condition: service_started }
+    environment:
+      CONFIG_SERVER_URL: http://config-server:8888
+      EUREKA_CLIENT_SERVICEURL_DEFAULTZONE: http://eureka-server:8761/eureka/
+      SPRING_DATASOURCE_URL: jdbc:mysql://mysql:3306/auth_db?createDatabaseIfNotExist=true&useSSL=false&allowPublicKeyRetrieval=true
+      SPRING_DATASOURCE_USERNAME: root
+      SPRING_DATASOURCE_PASSWORD: root
+      ZIPKIN_ENDPOINT: http://zipkin:9411/api/v2/spans
+
+  catalog-service:
+    build: ./catalog-service
+    container_name: shopsphere-catalog
+    profiles: ["all"]
+    ports:
+      - "8082:8082"
+    depends_on:
+      mysql: { condition: service_healthy }
+      eureka-server: { condition: service_started }
+      config-server: { condition: service_started }
+    environment:
+      CONFIG_SERVER_URL: http://config-server:8888
+      EUREKA_CLIENT_SERVICEURL_DEFAULTZONE: http://eureka-server:8761/eureka/
+      SPRING_DATASOURCE_URL: jdbc:mysql://mysql:3306/catalog_db?createDatabaseIfNotExist=true&useSSL=false&allowPublicKeyRetrieval=true
+      SPRING_DATASOURCE_USERNAME: root
+      SPRING_DATASOURCE_PASSWORD: root
+      ZIPKIN_ENDPOINT: http://zipkin:9411/api/v2/spans
+
+  order-service:
+    build: ./order-service
+    container_name: shopsphere-order
+    profiles: ["all"]
+    ports:
+      - "8083:8083"
+    depends_on:
+      mysql: { condition: service_healthy }
+      kafka: { condition: service_started }
+      eureka-server: { condition: service_started }
+      config-server: { condition: service_started }
+    environment:
+      CONFIG_SERVER_URL: http://config-server:8888
+      EUREKA_CLIENT_SERVICEURL_DEFAULTZONE: http://eureka-server:8761/eureka/
+      SPRING_DATASOURCE_URL: jdbc:mysql://mysql:3306/order_db?createDatabaseIfNotExist=true&useSSL=false&allowPublicKeyRetrieval=true
+      SPRING_DATASOURCE_USERNAME: root
+      SPRING_DATASOURCE_PASSWORD: root
+      KAFKA_BOOTSTRAP_SERVERS: kafka:29092
+      ZIPKIN_ENDPOINT: http://zipkin:9411/api/v2/spans
+
+  admin-service:
+    build: ./admin-service
+    container_name: shopsphere-admin
+    profiles: ["all"]
+    ports:
+      - "8084:8084"
+    depends_on:
+      eureka-server: { condition: service_started }
+      config-server: { condition: service_started }
+    environment:
+      CONFIG_SERVER_URL: http://config-server:8888
+      EUREKA_CLIENT_SERVICEURL_DEFAULTZONE: http://eureka-server:8761/eureka/
+      ZIPKIN_ENDPOINT: http://zipkin:9411/api/v2/spans
+
+  notification-service:
+    build: ./notification-service
+    container_name: shopsphere-notification
+    profiles: ["all"]
+    ports:
+      - "8085:8085"
+    depends_on:
+      kafka: { condition: service_started }
+      mailhog: { condition: service_started }
+      eureka-server: { condition: service_started }
+      config-server: { condition: service_started }
+    environment:
+      CONFIG_SERVER_URL: http://config-server:8888
+      EUREKA_CLIENT_SERVICEURL_DEFAULTZONE: http://eureka-server:8761/eureka/
+      KAFKA_BOOTSTRAP_SERVERS: kafka:29092
+      MAIL_HOST: mailhog
+      MAIL_PORT: "1025"
+      ZIPKIN_ENDPOINT: http://zipkin:9411/api/v2/spans
+
+volumes:
+  mysql_data:
+  prometheus_data:
+  grafana_data:
+  sonarqube_data:
+  sonarqube_logs:
+  sonarqube_extensions:
